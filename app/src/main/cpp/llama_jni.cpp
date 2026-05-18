@@ -1,0 +1,120 @@
+#include <jni.h>
+#include "llama.cpp/include/llama.h"
+#include <android/log.h>
+#include <string>
+#include <vector>
+#include <chrono>
+
+#define LOG_TAG "SLMEngine"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+static llama_model*   g_model = nullptr;
+static llama_context* g_ctx   = nullptr;
+
+extern "C" {
+
+JNIEXPORT jboolean JNICALL
+Java_com_interlekt_slmengine_LlamaWrapper_nativeLoadModel(
+        JNIEnv* env, jobject, jstring jpath) {
+
+    const char* path = env->GetStringUTFChars(jpath, nullptr);
+    LOGI("Loading model from: %s", path);
+
+    llama_model_params mparams = llama_model_default_params();
+    mparams.n_gpu_layers = 0;
+
+    g_model = llama_model_load_from_file(path, mparams);
+    env->ReleaseStringUTFChars(jpath, path);
+
+    if (!g_model) { LOGE("Failed to load model"); return JNI_FALSE; }
+    LOGI("Model loaded successfully");
+    return JNI_TRUE;
+}
+
+JNIEXPORT void JNICALL
+Java_com_interlekt_slmengine_LlamaWrapper_nativeGenerate(
+        JNIEnv* env, jobject,
+        jstring jprompt, jint maxTokens,
+        jobject callback) {
+
+    if (!g_model) { LOGE("No model loaded"); return; }
+
+    llama_context_params cparams = llama_context_default_params();
+    cparams.n_ctx     = 2048;
+    cparams.n_threads = 4;
+    g_ctx = llama_new_context_with_model(g_model, cparams);
+
+    const char* prompt = env->GetStringUTFChars(jprompt, nullptr);
+
+    // ---- NEW API: get vocab from model ----
+    const llama_vocab* vocab = llama_model_get_vocab(g_model);
+
+    // Tokenize using vocab
+    std::vector<llama_token> tokens(2048);
+    int n = llama_tokenize(vocab, prompt, strlen(prompt),
+                           tokens.data(), tokens.size(), true, true);
+    tokens.resize(n);
+    env->ReleaseStringUTFChars(jprompt, prompt);
+
+    // Initial decode
+    llama_batch batch = llama_batch_get_one(tokens.data(), tokens.size());
+    llama_decode(g_ctx, batch);
+
+    // Callback references
+    jclass    cbClass   = env->GetObjectClass(callback);
+    jmethodID onToken   = env->GetMethodID(cbClass, "onToken",   "(Ljava/lang/String;)V");
+    jmethodID onMetrics = env->GetMethodID(cbClass, "onMetrics", "(FJF)V");
+
+    // Sampler
+    llama_sampler* smpl = llama_sampler_chain_init(
+            llama_sampler_chain_default_params());
+    llama_sampler_chain_add(smpl, llama_sampler_init_temp(0.7f));
+    llama_sampler_chain_add(smpl, llama_sampler_init_dist(42));
+
+    auto t_start    = std::chrono::high_resolution_clock::now();
+    int  token_count = 0;
+
+    for (int i = 0; i < maxTokens; i++) {
+        llama_token id = llama_sampler_sample(smpl, g_ctx, -1);
+        if (llama_vocab_is_eog(vocab, id)) break;
+
+        // Token → text using vocab
+        char buf[256];
+        int  len = llama_token_to_piece(vocab, id, buf, sizeof(buf), 0, true);
+        if (len < 0) break;
+        buf[len] = '\0';
+        token_count++;
+
+        // Send token to Kotlin
+        jstring piece = env->NewStringUTF(buf);
+        env->CallVoidMethod(callback, onToken, piece);
+        env->DeleteLocalRef(piece);
+
+        // Metrics every 5 tokens
+        if (token_count % 5 == 0) {
+            auto  now     = std::chrono::high_resolution_clock::now();
+            float elapsed = std::chrono::duration<float, std::milli>(
+                    now - t_start).count();
+            float mpt = elapsed / token_count;
+            env->CallVoidMethod(callback, onMetrics,
+                                (jfloat)mpt, (jlong)0, (jfloat)0.0f);
+        }
+
+        // Next token decode
+        llama_batch next = llama_batch_get_one(&id, 1);
+        llama_decode(g_ctx, next);
+    }
+
+    llama_sampler_free(smpl);
+    llama_free(g_ctx);
+    g_ctx = nullptr;
+}
+
+JNIEXPORT void JNICALL
+Java_com_interlekt_slmengine_LlamaWrapper_nativeFreeModel(JNIEnv*, jobject) {
+    if (g_model) { llama_free_model(g_model); g_model = nullptr; }
+    LOGI("Model freed");
+}
+
+} // extern "C"
