@@ -42,7 +42,7 @@ Java_com_interlekt_slmengine_LlamaWrapper_nativeGenerate(
 
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx     = 2048;
-    cparams.n_threads = 4;
+    cparams.n_threads = 2;
     g_ctx = llama_new_context_with_model(g_model, cparams);
 
     const char* prompt = env->GetStringUTFChars(jprompt, nullptr);
@@ -107,6 +107,7 @@ Java_com_interlekt_slmengine_LlamaWrapper_nativeGenerate(
     }
 
     llama_sampler_free(smpl);
+    llama_perf_context_print(g_ctx);
     llama_free(g_ctx);
     g_ctx = nullptr;
 }

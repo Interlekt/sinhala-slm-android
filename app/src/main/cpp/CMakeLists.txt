@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.22.1)
 project(slmengine)
 
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
+endif()
+
 # Disable things we don't need — speeds up build
 set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
