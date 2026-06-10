@@ -5,6 +5,12 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
+# Force aggressive optimization for the hot inference code
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
+set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG")
+set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O3 -DNDEBUG")
+set(CMAKE_C_FLAGS_RELWITHDEBINFO "-O3 -DNDEBUG")
+
 # Disable things we don't need — speeds up build
 set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
