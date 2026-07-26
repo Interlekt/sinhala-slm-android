@@ -19,7 +19,8 @@ android {
             cmake {
                 arguments += listOf(
                     "-DCMAKE_BUILD_TYPE=Release",
-                    "-DANDROID_STL=c++_shared"
+                    "-DANDROID_STL=c++_shared",
+                    "-DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16"
                 )
                 cppFlags += listOf("-O3", "-DNDEBUG")
             }
