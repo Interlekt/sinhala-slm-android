@@ -29,6 +29,22 @@ Java_com_interlekt_slmengine_LlamaWrapper_nativeLoadModel(
 
     if (!g_model) { LOGE("Failed to load model"); return JNI_FALSE; }
     LOGI("Model loaded successfully");
+
+    // Create the context ONCE here, reuse across generations
+    llama_context_params cparams = llama_context_default_params();
+    cparams.n_ctx     = 1024;   // smaller context = less KV cache memory and faster attention
+    cparams.n_threads = 2;      // big cores only on Helio G85 (2 big + 6 little)
+    cparams.n_batch   = 512;    // prompt-eval batch size
+
+    g_ctx = llama_new_context_with_model(g_model, cparams);
+    if (!g_ctx) {
+        LOGE("Failed to create context");
+        llama_model_free(g_model);
+        g_model = nullptr;
+        return JNI_FALSE;
+    }
+    LOGI("Context created successfully");
+
     return JNI_TRUE;
 }
 
@@ -38,16 +54,13 @@ Java_com_interlekt_slmengine_LlamaWrapper_nativeGenerate(
         jstring jprompt, jint maxTokens,
         jobject callback) {
 
-    if (!g_model) { LOGE("No model loaded"); return; }
+    if (!g_model || !g_ctx) { LOGE("No model/context loaded"); return; }
 
-    llama_context_params cparams = llama_context_default_params();
-    cparams.n_ctx     = 2048;
-    cparams.n_threads = 4;
-    g_ctx = llama_new_context_with_model(g_model, cparams);
+    // Clear KV cache so prompts don't accumulate from previous generations
+    llama_memory_clear(llama_get_memory(g_ctx), true);
 
     const char* prompt = env->GetStringUTFChars(jprompt, nullptr);
 
-    // ---- NEW API: get vocab from model ----
     const llama_vocab* vocab = llama_model_get_vocab(g_model);
 
     // Tokenize using vocab
@@ -57,7 +70,7 @@ Java_com_interlekt_slmengine_LlamaWrapper_nativeGenerate(
     tokens.resize(n);
     env->ReleaseStringUTFChars(jprompt, prompt);
 
-    // Initial decode
+    // Initial decode (prompt eval)
     llama_batch batch = llama_batch_get_one(tokens.data(), tokens.size());
     llama_decode(g_ctx, batch);
 
@@ -79,19 +92,16 @@ Java_com_interlekt_slmengine_LlamaWrapper_nativeGenerate(
         llama_token id = llama_sampler_sample(smpl, g_ctx, -1);
         if (llama_vocab_is_eog(vocab, id)) break;
 
-        // Token → text using vocab
         char buf[256];
         int  len = llama_token_to_piece(vocab, id, buf, sizeof(buf), 0, true);
         if (len < 0) break;
         buf[len] = '\0';
         token_count++;
 
-        // Send token to Kotlin
         jstring piece = env->NewStringUTF(buf);
         env->CallVoidMethod(callback, onToken, piece);
         env->DeleteLocalRef(piece);
 
-        // Metrics every 5 tokens
         if (token_count % 5 == 0) {
             auto  now     = std::chrono::high_resolution_clock::now();
             float elapsed = std::chrono::duration<float, std::milli>(
@@ -101,20 +111,20 @@ Java_com_interlekt_slmengine_LlamaWrapper_nativeGenerate(
                                 (jfloat)mpt, (jlong)0, (jfloat)0.0f);
         }
 
-        // Next token decode
         llama_batch next = llama_batch_get_one(&id, 1);
         llama_decode(g_ctx, next);
     }
 
     llama_sampler_free(smpl);
-    llama_free(g_ctx);
-    g_ctx = nullptr;
+    llama_perf_context_print(g_ctx);
+    // Note: context is NOT freed here — it lives until nativeFreeModel
 }
 
 JNIEXPORT void JNICALL
 Java_com_interlekt_slmengine_LlamaWrapper_nativeFreeModel(JNIEnv*, jobject) {
-    if (g_model) { llama_free_model(g_model); g_model = nullptr; }
-    LOGI("Model freed");
+    if (g_ctx)   { llama_free(g_ctx); g_ctx = nullptr; }
+    if (g_model) { llama_model_free(g_model); g_model = nullptr; }
+    LOGI("Model and context freed");
 }
 
 } // extern "C"
