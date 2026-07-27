@@ -12,6 +12,7 @@ class LlamaWrapper {
     interface GenerationCallback {
         fun onToken(piece: String)
         fun onMetrics(msPerToken: Float, ramMB: Long, cpuPct: Float)
+        fun onPrompt(nTokens: Int)
     }
 
     fun loadModel(path: String): Boolean = nativeLoadModel(path)

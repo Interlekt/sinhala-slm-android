@@ -19,7 +19,9 @@ set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
 
 add_subdirectory(llama.cpp)
 
-add_library(llama_jni SHARED llama_jni.cpp)
+add_library(llama_jni SHARED
+        llama_jni.cpp
+        embed_jni.cpp)
 
 target_link_libraries(llama_jni
         llama
