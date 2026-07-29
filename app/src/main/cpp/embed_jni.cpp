@@ -12,12 +12,16 @@
 //   llama_model_get_vocab        (was implicit in llama_tokenize)
 //   llama_model_n_embd           (was llama_n_embd)
 //   llama_memory_clear           (was llama_kv_cache_clear)
+//
+// NOTE llama_model_params has no use_mmap field on this API generation;
+// llama_model_default_params() already enables mmap.
 
 #include <jni.h>
 #include <android/log.h>
 
 #include <cmath>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -33,8 +37,20 @@ namespace {
     llama_context * g_ctx   = nullptr;
     int             g_n_embd = 0;
 
-// Your llama_jni.cpp almost certainly calls llama_backend_init() already.
-// Guard so a double call is harmless.
+    // The model and context above are file-scope, so every EmbeddingEngine
+    // instance shares ONE native engine — a second Kotlin object is not a
+    // second encoder. Without this lock, two callers reaching load()/embed()/
+    // free() concurrently can free a context another thread is still using
+    // (observed as SIGSEGV/SEGV_MAPERR) or overwrite a loaded model pointer,
+    // leaking ~610 MB.
+    //
+    // The realistic trigger here is lifecycle rather than concurrency:
+    // InferenceViewModel.onCleared() calls free(), and an activity destroyed
+    // mid-batch would race a retrieval in flight.
+    std::mutex g_mtx;
+
+    // llama_jni.cpp almost certainly calls llama_backend_init() already.
+    // Guard so a double call is harmless.
     bool g_backend_ready = false;
 
     void ensure_backend() {
@@ -60,6 +76,10 @@ JNIEXPORT jboolean JNICALL
 Java_com_interlekt_slmengine_EmbeddingEngine_nativeLoad(
         JNIEnv * env, jobject /*thiz*/, jstring jpath, jint n_threads, jint n_ctx) {
 
+    // Taken before ensure_backend() and before the null check: two threads
+    // both reading g_ctx as null is exactly the race this prevents.
+    std::lock_guard<std::mutex> lock(g_mtx);
+
     ensure_backend();
 
     if (g_ctx != nullptr) {
@@ -71,7 +91,6 @@ Java_com_interlekt_slmengine_EmbeddingEngine_nativeLoad(
 
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = 0;
-    mparams.use_mmap     = true;
 
     g_model = llama_model_load_from_file(path.c_str(), mparams);
     if (g_model == nullptr) {
@@ -82,9 +101,9 @@ Java_com_interlekt_slmengine_EmbeddingEngine_nativeLoad(
     llama_context_params cparams = llama_context_default_params();
     cparams.embeddings      = true;
     // UNSPECIFIED makes llama.cpp honour the pooling type baked into the GGUF
-    // by convert_hf_to_gguf.py. For BGE-M3 that should resolve to CLS. Verify
-    // in logcat below -- if it resolves to MEAN, your embeddings will NOT match
-    // the desktop pipeline and you must force LLAMA_POOLING_TYPE_CLS here.
+    // by convert_hf_to_gguf.py. For BGE-M3 that resolves to CLS (verified on
+    // device: "pooling=2"). If it ever resolves to MEAN, embeddings will NOT
+    // match the desktop pipeline and LLAMA_POOLING_TYPE_CLS must be forced.
     cparams.pooling_type    = LLAMA_POOLING_TYPE_UNSPECIFIED;
     cparams.n_ctx           = (uint32_t) n_ctx;   // 512 is plenty for queries
     cparams.n_batch         = (uint32_t) n_ctx;
@@ -116,12 +135,19 @@ Java_com_interlekt_slmengine_EmbeddingEngine_nativeLoad(
 JNIEXPORT jint JNICALL
 Java_com_interlekt_slmengine_EmbeddingEngine_nativeEmbedDim(
         JNIEnv * /*env*/, jobject /*thiz*/) {
+    std::lock_guard<std::mutex> lock(g_mtx);
     return g_n_embd;
 }
 
 JNIEXPORT jfloatArray JNICALL
 Java_com_interlekt_slmengine_EmbeddingEngine_nativeEmbed(
         JNIEnv * env, jobject /*thiz*/, jstring jtext) {
+
+    // Held for the WHOLE encode, not just the entry check. A free() arriving
+    // mid-encode must wait rather than pull the context out from under it.
+    // Embedding takes ~250-1300 ms on the G85, so a queued caller simply waits
+    // its turn; the alternative is a use-after-free.
+    std::lock_guard<std::mutex> lock(g_mtx);
 
     if (g_ctx == nullptr) {
         LOGE("nativeEmbed called before nativeLoad");
@@ -184,7 +210,9 @@ Java_com_interlekt_slmengine_EmbeddingEngine_nativeEmbed(
     }
 
     // L2 normalise. llama.cpp does NOT do this in-library; the CLI example
-    // normalises in userland, and BGE-M3 dense vectors are unit-length.
+    // normalises in userland, and BGE-M3 dense vectors are unit-length. The
+    // device-side dot product against the shipped corpus vectors is therefore
+    // cosine similarity directly, with no conversion.
     std::vector<float> out(g_n_embd);
     double ss = 0.0;
     for (int i = 0; i < g_n_embd; ++i) ss += (double) emb[i] * (double) emb[i];
@@ -201,6 +229,10 @@ Java_com_interlekt_slmengine_EmbeddingEngine_nativeEmbed(
 JNIEXPORT void JNICALL
 Java_com_interlekt_slmengine_EmbeddingEngine_nativeFree(
         JNIEnv * /*env*/, jobject /*thiz*/) {
+    // Blocks until any in-flight embed() finishes. This is the call that
+    // onCleared() makes, and the one that used to crash a batch when the
+    // activity was destroyed mid-retrieval.
+    std::lock_guard<std::mutex> lock(g_mtx);
     if (g_ctx)   { llama_free(g_ctx);         g_ctx   = nullptr; }
     if (g_model) { llama_model_free(g_model); g_model = nullptr; }
     g_n_embd = 0;

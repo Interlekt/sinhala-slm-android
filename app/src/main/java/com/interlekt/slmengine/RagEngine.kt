@@ -8,6 +8,8 @@ import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.text.Normalizer
+import kotlin.math.exp
+import kotlin.math.round
 
 private const val TAG = "SLMRag"
 
@@ -39,19 +41,73 @@ data class Boundary(
     val overlap: Double,
     val reason: String,
     val firedConditions: String,   // which gate(s) actually passed
+    /** P(within syllabus) from the logistic model. -1.0 for the two legacy
+     *  modes, which have no single probability. */
+    val probability: Double = -1.0,
 ) {
     val inBoundary: Boolean get() = !isOutOfSyllabus
 }
 
 /**
- * DESKTOP_PARITY  reproduces knowledge_boundary_detection() exactly, including
- *                 the top_score gate that can never fire (threshold 0.035 vs a
- *                 maximum achievable fused score of 2/61 = 0.032787).
- * CALIBRATED      gates on dense cosine + IDF-weighted overlap, combined with
- *                 AND rather than OR.
- * Report both.
+ * DESKTOP_PARITY        legacy fixed-threshold rule: top_score OR avg_score OR
+ *                       overlap, on FUSED RRF scores. top_score never fires in
+ *                       practice — calibration selected a threshold above the
+ *                       achievable RRF maximum, deliberately switching that
+ *                       branch off. Kept for historical comparison only; this
+ *                       is NOT what the desktop runs any more (see LOGISTIC).
+ * CALIBRATED            this project's proposed variant: (topCos OR meanCos)
+ *                       AND idfOverlap.
+ * LOGISTIC_REGRESSION   the CURRENT desktop implementation, per
+ *                       knowledge_boundary.py: a logistic regression over
+ *                       five raw signals from two SEPARATE retrieval passes
+ *                       (dense-only top-5, BM25-only top-5) — not the fused
+ *                       hybrid list used to build the LLM-facing context.
+ *                       Report all three.
  */
-enum class BoundaryMode { DESKTOP_PARITY, CALIBRATED }
+enum class BoundaryMode { DESKTOP_PARITY, CALIBRATED, LOGISTIC_REGRESSION }
+
+/**
+ * Every signal any of the three detectors uses, computed on every query
+ * regardless of which mode is active.
+ *
+ * Recording all of these means one results file supports evaluating any of the
+ * three boundaries offline and sweeping thresholds without re-running 45
+ * minutes of inference. Retrieval is unchanged by the choice of gate, so the
+ * signals are identical across modes — only which of them is consulted
+ * differs.
+ */
+data class BoundarySignals(
+    // ── legacy fixed-threshold inputs (fused RRF list) ──────────────────────
+    val topScore: Double,        // max fused RRF score  — rank-derived
+    val avgScore: Double,        // mean fused RRF score — rank-derived
+    val overlap: Double,         // token overlap, query vs FUSED hybrid context
+    val topCos: Double,          // max dense cosine     — similarity
+    val meanCos: Double,         // mean dense cosine over top_k
+    val idfOverlap: Double,      // IDF-weighted token overlap (fused context)
+
+    // ── logistic-regression inputs (SEPARATE dense-only / bm25-only passes) ─
+    /** dense_top / dense_avg in knowledge_boundary.py. Numerically identical
+     *  to topCos/meanCos above — both come from the same dense-only ranking —
+     *  duplicated under the Python names so sig_* fields map 1:1 to KB_MODEL's
+     *  feature list without a name-translation step at analysis time. */
+    val denseTop: Double,
+    val denseAvg: Double,
+    /** Token overlap against the DENSE-ONLY context, NOT the fused hybrid
+     *  context. This is the one signal that genuinely differs from `overlap`
+     *  above — the two contexts can contain different chunks entirely. */
+    val overlapDense: Double,
+    /** Raw, unbounded BM25 Okapi score. NOT normalised on the Kotlin side —
+     *  ported to match knowledge_boundary.py's inference-time behaviour
+     *  exactly, which multiplies KB_MODEL coefficients against these raw
+     *  values. See the caveat on KbModel below before trusting this mode. */
+    val bm25Top: Double,
+    val bm25Avg: Double,
+    /** True iff the dense-only top-5 pool is non-empty. Mirrors Python's
+     *  `bool(dense_results)` gate — the logistic score alone cannot admit a
+     *  query with zero retrieved evidence. */
+    val hasDenseResults: Boolean,
+    val logisticProbability: Double,
+)
 
 data class RagResult(
     val results: List<Retrieved>,
@@ -60,8 +116,11 @@ data class RagResult(
     val retrievalMs: Long,
     val embedMs: Long,
     /** (docIndex, cosine) for the dense pool, best first. Needed by the
-     *  calibrated boundary detector and recorded by EvalRunner. */
+     *  calibrated and logistic boundary detectors and recorded by EvalRunner. */
     val denseCosine: List<Pair<Int, Double>>,
+    /** All signals across all three boundary modes, so any of them can be
+     *  evaluated offline regardless of which one produced this run. */
+    val signals: BoundarySignals,
     /** The query vector the device actually computed. Logged so a desktop
      *  reference can be driven by it, removing ARM-vs-x86 embedding drift as a
      *  confound in parity checks. */
@@ -81,7 +140,7 @@ data class RagConfig(
     val bm25Pool: Int,
     val k1: Double,
     val b: Double,
-    // desktop parity
+    // desktop parity (legacy)
     val topScoreThreshold: Double,
     val avgScoreThreshold: Double,
     val overlapThreshold: Double,
@@ -119,6 +178,56 @@ data class RagConfig(
     }
 }
 
+/**
+ * Port of KB_MODEL from knowledge_boundary.py — a logistic regression fit
+ * offline on 746 labelled queries (373 in / 373 out), 5-fold CV + held-out
+ * test. precision=0.881 recall=0.787 f1=0.831 auc=0.900 on the reported
+ * holdout.
+ *
+ * RE-FIT PROCEDURE: whenever the Python side re-runs threshold.ipynb and
+ * updates KB_MODEL in knowledge_boundary.py, COEF and INTERCEPT below must be
+ * copied over in the same commit. Nothing checks that these two copies agree;
+ * a stale copy here fails silently as a wrong-but-plausible probability.
+ * Consider moving this into manifest.json to remove the duplication.
+ *
+ * CAVEAT — read before trusting LOGISTIC_REGRESSION mode. The Python
+ * docstring states bm25_top/bm25_avg were "StandardScaler-normalized at fit
+ * time", but _kb_probability multiplies COEF straight against raw, unbounded
+ * BM25 scores with no scaling step. If the coefficients were extracted from a
+ * fitted Pipeline(StandardScaler, LogisticRegression) without algebraically
+ * folding the scaler's mean/std into the coefficients (coef' = coef / std,
+ * intercept' = intercept - sum(coef * mean / std)), every prediction on real,
+ * unbounded BM25 scores is wrong. This port is byte-for-byte faithful to the
+ * Python inference code as given — it reproduces the same behaviour,
+ * correct or not. Verify the fitting notebook actually performs that folding
+ * before reporting LOGISTIC_REGRESSION results.
+ */
+object KbModel {
+    // order: dense_top, dense_avg, overlap, bm25_top, bm25_avg
+    val COEF = doubleArrayOf(
+        16.635537971221343,
+        -3.600315847669902,
+        6.80005994581478,
+        0.17017883789280802,
+        -0.2632195057850517,
+    )
+    const val INTERCEPT = -10.486943570616237
+    const val PROBABILITY_THRESHOLD = 0.5
+
+    fun probability(denseTop: Double, denseAvg: Double, overlap: Double,
+                    bm25Top: Double, bm25Avg: Double): Double {
+        val z = INTERCEPT +
+                COEF[0] * denseTop +
+                COEF[1] * denseAvg +
+                COEF[2] * overlap +
+                COEF[3] * bm25Top +
+                COEF[4] * bm25Avg
+        return 1.0 / (1.0 + exp(-z))
+    }
+}
+
+private fun round3(x: Double): Double = round(x * 1000.0) / 1000.0
+
 // ─── Engine ──────────────────────────────────────────────────────────────────
 
 class RagEngine(private val embedder: EmbeddingEngine) {
@@ -134,7 +243,7 @@ class RagEngine(private val embedder: EmbeddingEngine) {
     private var avgdl: Double = 0.0
     private var maxIdf: Double = 1.0
 
-    var boundaryMode: BoundaryMode = BoundaryMode.DESKTOP_PARITY
+    var boundaryMode: BoundaryMode = BoundaryMode.LOGISTIC_REGRESSION
 
     var loaded: Boolean = false
         private set
@@ -227,6 +336,13 @@ class RagEngine(private val embedder: EmbeddingEngine) {
     // The desktop uses TWO different tokenizers. They are not interchangeable:
     //   tokenize()       <- _tokenize_si    in rag/src/retrieval.py       (BM25)
     //   boundaryTokens() <- _boundary_tokens in knowledge_boundary.py  (overlap)
+    //
+    // _boundary_tokens is unchanged by the logistic-regression rewrite:
+    // re.findall(r"[\w඀-෿]+", text.lower()) is identical to the version this
+    // was ported against before. \w already excludes ZWJ/ZWNJ (category Cf),
+    // so findall naturally splits on them without any explicit stripping —
+    // boundaryTokens() below reproduces that by converting the joiners to
+    // spaces before matching, which is equivalent.
 
     /**
      * Verbatim port of _tokenize_si.
@@ -252,12 +368,6 @@ class RagEngine(private val embedder: EmbeddingEngine) {
             val cp: Int = normalized.codePointAt(i)
             val n: Int = Character.charCount(cp)
             val type: Int = Character.getType(cp)
-            // Python's str.split() separates on ALL Unicode whitespace, so
-            // anything Python would treat as a separator must become one here.
-            // isWhitespace covers ASCII controls and most Zs; isSpaceChar adds
-            // the non-breaking spaces isWhitespace omits (U+00A0, U+202F,
-            // U+2007), which PDF-extracted text is full of. Splitting on ASCII
-            // whitespace alone silently merges tokens and shifts BM25 ranks.
             if (isPunctOrSymbol(type) ||
                 Character.isWhitespace(cp) ||
                 Character.isSpaceChar(cp)) {
@@ -289,29 +399,10 @@ class RagEngine(private val embedder: EmbeddingEngine) {
         else -> false
     }
 
-    /**
-     * Port of _boundary_tokens: re.findall(r"[\w\u0D80-\u0DFF]+", text.lower())
-     *
-     * Written without \w because Android's regex engine is ICU, which rejects
-     * the JDK-only (?U) flag, and bare \w on Android is ASCII-only.
-     *
-     * \p{L}\p{N}_ reproduces Python's \w: CPython's SRE_UNI_IS_WORD is
-     * isalnum() || '_', i.e. categories L* and N* plus underscore. Note that
-     * does NOT include combining marks — which is exactly why the original
-     * pattern adds the Sinhala block explicitly, since the vowel signs at
-     * U+0DCF-U+0DDF are Mc/Mn and would otherwise be dropped.
-     */
+    /** Port of _boundary_tokens: re.findall(r"[\w඀-෿]+", text.lower()). */
     private val boundaryRe = Regex("""[\p{L}\p{N}_\u0D80-\u0DFF]+""")
 
     private fun boundaryTokens(text: String): Set<String> {
-        // Python's \w matches neither U+200D nor U+200C, so _boundary_tokens
-        // SPLITS at the joiners: ප්‍රධාන -> {ප්, රධාන}. Converting them to
-        // spaces reproduces that exactly, without depending on how ICU parses
-        // the \u0D80-\u0DFF range inside a Kotlin raw string.
-        //
-        // Note this is the OPPOSITE of tokenize(), which STRIPS the joiners
-        // because _tokenize_si does. Two tokenizers, two treatments of the same
-        // character; the desktop does this and it must be mirrored, not unified.
         val prepared = text.lowercase()
             .replace('\u200d', ' ')
             .replace('\u200c', ' ')
@@ -321,7 +412,7 @@ class RagEngine(private val embedder: EmbeddingEngine) {
     // ── Dense retrieval ──────────────────────────────────────────────────────
     // Flat fp32 scan. 1767 x 1024 is ~1.8M multiply-adds, single-digit ms.
     // Both sides are unit-norm, so the dot product IS cosine similarity —
-    // no conversion, and the calibrated boundary detector can gate on it.
+    // no conversion, and both the calibrated and logistic detectors gate on it.
 
     private fun denseSearch(query: FloatArray, pool: Int): List<Pair<Int, Double>> {
         val dim = config.embeddingDim
@@ -340,16 +431,8 @@ class RagEngine(private val embedder: EmbeddingEngine) {
 
     /**
      * Matches rank_bm25 BM25Okapi.get_scores + KeyWordRetriever.search.
-     *
-     * Three parity details:
-     *  - Query tokens are iterated WITH duplicates, so a repeated term counts
-     *    twice, as rank_bm25 does.
-     *  - Every document is scored and exactly `pool` returned regardless of
-     *    score. KeyWordRetriever.search applies no floor, so zero-scoring
-     *    documents still enter the fusion and receive RRF weight. Returning
-     *    only matched documents would shift every subsequent BM25 rank.
-     *  - Kotlin's sortedByDescending is stable, matching Python's
-     *    sorted(..., reverse=True), which breaks ties by ascending index.
+     * Every document is scored and exactly `pool` returned regardless of
+     * score, matching the reference's no-floor behaviour.
      */
     private fun bm25Search(query: String, pool: Int): List<Pair<Int, Double>> {
         val terms = tokenize(query)
@@ -384,20 +467,11 @@ class RagEngine(private val embedder: EmbeddingEngine) {
         dense: List<Pair<Int, Double>>,
         bm25: List<Pair<Int, Double>>,
     ): List<Pair<Int, Double>> {
-        // LinkedHashMap, dense inserted FIRST, because HybridRetriever builds
-        // its result list by iterating a Python dict — which preserves
-        // insertion order.
-        //
-        // Not a micro-detail: exact ties are the norm here. A document at dense
-        // rank r and a different document at bm25 rank r both score precisely
-        // w/(rrf_k + r). On any query where no document appears in both lists —
-        // i.e. every out-of-domain query — the whole top-5 is decided by
-        // tie-breaking. HashMap breaks those ties in hash-bucket order and
-        // silently reshuffles the result.
-        //
-        // LinkedHashMap.put on an existing key leaves its position unchanged,
-        // matching Python dict semantics, and sortedByDescending is stable, so
-        // ties resolve to insertion order.
+        // LinkedHashMap, dense inserted FIRST: HybridRetriever builds its
+        // result list by iterating a Python dict, which preserves insertion
+        // order. Equal-weight RRF produces exact ties whenever a document
+        // appears in only one list, so tie-breaking order is load-bearing,
+        // not cosmetic — see VALIDATION_RECORD.md D1.
         val fused = LinkedHashMap<Int, Double>()
         val k = config.rrfK.toDouble()
         dense.forEachIndexed { idx, (doc, _) ->
@@ -409,22 +483,94 @@ class RagEngine(private val embedder: EmbeddingEngine) {
         return fused.entries.sortedByDescending { it.value }.map { it.key to it.value }
     }
 
+    private fun contextOf(items: List<Pair<Int, Double>>): String =
+        items.joinToString("") { (doc, _) -> "[${chunks[doc].text}]" }
+
     // ── Boundary detection ───────────────────────────────────────────────────
 
-    /** Faithful port of knowledge_boundary_detection(). OR across three gates. */
-    private fun boundaryDesktopParity(
+    /**
+     * All signals used by any of the three detectors, computed once so every
+     * mode sees identical inputs — a difference between modes is then the
+     * decision rule alone, not a difference in what was measured.
+     *
+     * @param denseTop5 the dense-ONLY pool, already sorted descending
+     *        (denseCosine from the caller), truncated to config.topK.
+     * @param bm25Top5  the BM25-ONLY pool, same truncation.
+     * @param denseOnlyContext context built from denseTop5 alone — NOT the
+     *        fused hybrid context. This is what Python's mode="dense" call
+     *        produces and what the logistic overlap feature is measured
+     *        against.
+     */
+    private fun computeSignals(
         query: String,
+        fusedResults: List<Retrieved>,
+        fusedContextStr: String,
+        denseTop5: List<Pair<Int, Double>>,
+        bm25Top5: List<Pair<Int, Double>>,
+        denseOnlyContext: String,
+    ): BoundarySignals {
+        val queryTokens = boundaryTokens(query)
+
+        // legacy: overlap against the FUSED hybrid context
+        val fusedContextTokens = boundaryTokens(fusedContextStr)
+        val overlapFused = if (queryTokens.isEmpty()) 0.0
+        else queryTokens.count { it in fusedContextTokens }.toDouble() / queryTokens.size
+
+        // logistic: overlap against the DENSE-ONLY context — genuinely
+        // different chunks from the fused list in general
+        val denseContextTokens = boundaryTokens(denseOnlyContext)
+        val overlapDense = if (queryTokens.isEmpty()) 0.0
+        else queryTokens.count { it in denseContextTokens }.toDouble() / queryTokens.size
+
+        // IDF-weighted overlap (this project's CALIBRATED mode), against the
+        // fused context, unchanged by the logistic rewrite.
+        var num = 0.0
+        var den = 0.0
+        for (t in queryTokens) {
+            val w = idf[t] ?: maxIdf
+            den += w
+            if (t in fusedContextTokens) num += w
+        }
+        val idfOverlap = if (den > 0.0) num / den else 0.0
+
+        val denseScores = denseTop5.map { it.second }
+        val bm25Scores = bm25Top5.map { it.second }
+        val denseTop = denseScores.maxOrNull() ?: 0.0
+        val denseAvg = if (denseScores.isEmpty()) 0.0 else denseScores.average()
+        val bm25Top = bm25Scores.maxOrNull() ?: 0.0
+        val bm25Avg = if (bm25Scores.isEmpty()) 0.0 else bm25Scores.average()
+
+        val probability = KbModel.probability(denseTop, denseAvg, overlapDense, bm25Top, bm25Avg)
+
+        return BoundarySignals(
+            topScore = fusedResults.maxOfOrNull { it.score } ?: 0.0,
+            avgScore = if (fusedResults.isEmpty()) 0.0 else fusedResults.map { it.score }.average(),
+            overlap = overlapFused,
+            topCos = denseTop,     // identical value, Python-named alias below
+            meanCos = denseAvg,
+            idfOverlap = idfOverlap,
+            denseTop = denseTop,
+            denseAvg = denseAvg,
+            overlapDense = overlapDense,
+            bm25Top = bm25Top,
+            bm25Avg = bm25Avg,
+            hasDenseResults = denseTop5.isNotEmpty(),
+            logisticProbability = probability,
+        )
+    }
+
+    /** Faithful port of the legacy knowledge_boundary_detection() threshold
+     *  rule. Superseded on the desktop by LOGISTIC_REGRESSION; kept for
+     *  historical comparison. OR across three gates. */
+    private fun boundaryDesktopParity(
+        sig: BoundarySignals,
         results: List<Retrieved>,
         contextStr: String,
         minChunks: Int = 1,
     ): Boundary {
-        val queryTokens = boundaryTokens(query)
-        val contextTokens = boundaryTokens(contextStr)
-
-        val topScore = results.maxOfOrNull { it.score } ?: 0.0
-        val avgScore = if (results.isEmpty()) 0.0 else results.map { it.score }.average()
-        val overlap = if (queryTokens.isEmpty()) 0.0
-        else queryTokens.count { it in contextTokens }.toDouble() / queryTokens.size
+        val topScore = sig.topScore
+        val avgScore = sig.avgScore
+        val overlap = sig.overlap
         val evidenceChars = contextStr.trim().length
 
         val topOk = topScore >= config.topScoreThreshold
@@ -434,19 +580,12 @@ class RagEngine(private val embedder: EmbeddingEngine) {
         val supported = results.isNotEmpty() && results.size >= minChunks &&
                 evidenceChars > 0 && (topOk || avgOk || ovlOk)
 
-        // Which gate actually carried the decision. Log this: on your config
-        // topOk can never be true, so if only ovlOk ever fires, the abstention
-        // mechanism is lexical overlap alone and the dense retriever plays no
-        // part in it.
         val fired = listOfNotNull(
             if (topOk) "top" else null,
             if (avgOk) "avg" else null,
             if (ovlOk) "overlap" else null,
         ).joinToString("+").ifEmpty { "none" }
 
-        // Mirrors the Python confidence field. Because it maxes a ~0.03-scale
-        // RRF score against a 0-1 ratio it is always `overlap`. Kept for parity;
-        // do not present it as a confidence.
         val confidence = minOf(0.99, maxOf(0.01, maxOf(topScore, avgScore, overlap)))
 
         val reasons = if (supported) {
@@ -477,37 +616,16 @@ class RagEngine(private val embedder: EmbeddingEngine) {
         )
     }
 
-    /**
-     * Proposed variant:
-     *   1. gates on dense COSINE, not fused RRF score (calibrated, interpretable,
-     *      and on a scale where thresholds mean something)
-     *   2. IDF-weighted overlap — plain token overlap on inflected Sinhala
-     *      rewards common particles and penalises specific queries
-     *   3. AND across two independent signals instead of OR across three
-     */
+    /** This project's proposed variant: cosine gate + IDF-weighted overlap,
+     *  AND-combined. */
     private fun boundaryCalibrated(
-        query: String,
+        sig: BoundarySignals,
         results: List<Retrieved>,
         contextStr: String,
-        denseCosine: List<Pair<Int, Double>>,
     ): Boundary {
-        val topCos = denseCosine.maxOfOrNull { it.second } ?: 0.0
-        val meanCos = if (denseCosine.isEmpty()) 0.0
-        else denseCosine.take(config.topK).map { it.second }.average()
-
-        val queryTokens = boundaryTokens(query)
-        val contextTokens = boundaryTokens(contextStr)
-
-        // A query term absent from the whole corpus is maximally informative,
-        // and its absence maximally damning — so it gets maxIdf, not zero.
-        var num = 0.0
-        var den = 0.0
-        for (t in queryTokens) {
-            val w = idf[t] ?: maxIdf
-            den += w
-            if (t in contextTokens) num += w
-        }
-        val idfOverlap = if (den > 0.0) num / den else 0.0
+        val topCos = sig.topCos
+        val meanCos = sig.meanCos
+        val idfOverlap = sig.idfOverlap
 
         val semanticOk = topCos >= config.cosineTopThreshold ||
                 meanCos >= config.cosineMeanThreshold
@@ -526,7 +644,7 @@ class RagEngine(private val embedder: EmbeddingEngine) {
         return Boundary(
             label = if (supported) "within syllabus" else "out of syllabus",
             isOutOfSyllabus = !supported,
-            confidence = topCos,          // an actual similarity, one scale
+            confidence = topCos,
             topScore = topCos,
             avgScore = meanCos,
             overlap = idfOverlap,
@@ -537,6 +655,36 @@ class RagEngine(private val embedder: EmbeddingEngine) {
                 if (semanticOk) "semantic" else null,
                 if (lexicalOk) "lexical" else null,
             ).joinToString("+").ifEmpty { "none" },
+        )
+    }
+
+    /**
+     * Port of the CURRENT knowledge_boundary_detection(): logistic regression
+     * over (dense_top, dense_avg, overlap-vs-dense-context, bm25_top,
+     * bm25_avg). See KbModel's doc comment for the StandardScaler caveat
+     * before trusting this in a report.
+     */
+    private fun boundaryLogistic(sig: BoundarySignals): Boundary {
+        val p = sig.logisticProbability
+        val supported = sig.hasDenseResults && p >= KbModel.PROBABILITY_THRESHOLD
+        val confidence = round3(if (supported) p else 1.0 - p)
+
+        // Matches Python's f-string exactly: P(...)={p:.3f}, dense_top/avg and
+        // overlap at 3 decimals, bm25_top/avg at 2 — porting the precision
+        // difference too, since it is what the reference actually prints.
+        val reason = "P(within syllabus)=%.3f (dense_top=%.3f, dense_avg=%.3f, overlap=%.3f, bm25_top=%.2f, bm25_avg=%.2f)"
+            .format(p, sig.denseTop, sig.denseAvg, sig.overlapDense, sig.bm25Top, sig.bm25Avg)
+
+        return Boundary(
+            label = if (supported) "within syllabus" else "out of syllabus",
+            isOutOfSyllabus = !supported,
+            confidence = confidence,
+            topScore = sig.denseTop,
+            avgScore = sig.denseAvg,
+            overlap = sig.overlapDense,
+            reason = reason,
+            firedConditions = if (supported) "logistic_accept" else "logistic_reject",
+            probability = round(p * 10000.0) / 10000.0,   // round(...,4) in Python
         )
     }
 
@@ -553,7 +701,7 @@ class RagEngine(private val embedder: EmbeddingEngine) {
         val embedMs = System.currentTimeMillis() - tEmbed
 
         val tRet = System.currentTimeMillis()
-        val (results, denseCosine) = withContext(Dispatchers.Default) {
+        val (results, denseCosine, bm25Pool) = withContext(Dispatchers.Default) {
             val dense = denseSearch(qVec, config.densePool)
             val bm25 = bm25Search(query, config.bm25Pool)
             val cosByDoc = dense.toMap()
@@ -562,26 +710,39 @@ class RagEngine(private val embedder: EmbeddingEngine) {
                 .mapIndexed { i, (doc, score) ->
                     Retrieved(i + 1, score, cosByDoc[doc] ?: 0.0, chunks[doc])
                 }
-            fused to dense
+            Triple(fused, dense, bm25)
         }
         val retrievalMs = System.currentTimeMillis() - tRet
 
-        // Same concatenation as the desktop pipeline: "[text][text]..."
+        // Fused hybrid context — what the LLM prompt is built from.
         val contextStr = results.joinToString("") { "[${it.chunk.text}]" }
 
+        // Dense-only and BM25-only top-k pools, truncated from the pools
+        // already computed above — no extra retrieval pass needed, since both
+        // pools are already sorted descending by their own score.
+        val denseTop5 = denseCosine.take(config.topK)
+        val bm25Top5 = bm25Pool.take(config.topK)
+        val denseOnlyContext = contextOf(denseTop5)
+
+        val signals = computeSignals(
+            query, results, contextStr, denseTop5, bm25Top5, denseOnlyContext)
+
         val boundary = when (boundaryMode) {
-            BoundaryMode.DESKTOP_PARITY -> boundaryDesktopParity(query, results, contextStr)
-            BoundaryMode.CALIBRATED -> boundaryCalibrated(query, results, contextStr, denseCosine)
+            BoundaryMode.DESKTOP_PARITY -> boundaryDesktopParity(signals, results, contextStr)
+            BoundaryMode.CALIBRATED -> boundaryCalibrated(signals, results, contextStr)
+            BoundaryMode.LOGISTIC_REGRESSION -> boundaryLogistic(signals)
         }
 
         Log.i(TAG, "q=\"${query.take(40)}\" embed=${embedMs}ms retrieve=${retrievalMs}ms " +
                 "ids=${results.map { it.chunk.id }} " +
-                "fused=${results.map { "%.6f".format(it.score) }} " +
-                "cos=${results.map { "%.4f".format(it.cosine) }} " +
-                "boundary=${boundary.label} fired=${boundary.firedConditions}")
+                "boundary=${boundary.label} fired=${boundary.firedConditions} " +
+                "prob=${"%.4f".format(signals.logisticProbability)} " +
+                "sig[dTop=${"%.4f".format(signals.denseTop)} dAvg=${"%.4f".format(signals.denseAvg)} " +
+                "ovlD=${"%.3f".format(signals.overlapDense)} " +
+                "bTop=${"%.4f".format(signals.bm25Top)} bAvg=${"%.4f".format(signals.bm25Avg)}]")
 
         return RagResult(results, contextStr, boundary, retrievalMs, embedMs,
-            denseCosine, qVec)
+            denseCosine, signals, qVec)
     }
 }
 
@@ -598,20 +759,10 @@ object PromptBuilder {
 සන්දර්භයේ නොමැති කිසිදු තොරතුරක් එකතු නොකරන්න.
 සන්දර්භයේ පිළිතුර නොමැති නම්, "$ABSTAIN" යනුවෙන් පමණක් පිළිතුරු දෙන්න."""
 
-    /** Calibrate against SinLlama's actual BPE rather than trusting this. */
     private const val CHARS_PER_TOKEN = 2.5
 
     fun abstentionAnswer(): String = ABSTAIN
 
-    /**
-     * Lexical sentence filter under a hard token budget.
-     *
-     * At 42 ms/token prefill, 384 tokens ≈ 16 s to first token. Raising the
-     * budget buys evidence and costs latency roughly linearly.
-     *
-     * This can INCREASE hallucination by dropping needed evidence. Measure HCM
-     * with it on and off before trusting it.
-     */
     fun compress(query: String, results: List<Retrieved>, tokenBudget: Int = 384): String {
         val qTerms = query.lowercase().split(Regex("""\W+""")).filter { it.length > 1 }.toSet()
         val budgetChars = (tokenBudget * CHARS_PER_TOKEN).toInt()
@@ -634,15 +785,11 @@ object PromptBuilder {
                 } else Pair(acc, used)
             }.first
 
-        // Restore document order so the SLM sees coherent prose.
         return kept.sortedWith(compareBy({ it.chunkRank }, { it.order }))
             .joinToString(" ") { it.text }
     }
 
-    /** Llama-3 template. nativeGenerate must NOT wrap this again — see step 7. */
     fun build(query: String, context: String): String = buildString {
-        // No <|begin_of_text|>: llama_jni.cpp tokenizes with add_special=true,
-        // which already prepends BOS. Including it here would double it.
         append("<|start_header_id|>system<|end_header_id|>\n\n")
         append(SYSTEM)
         append("<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n")

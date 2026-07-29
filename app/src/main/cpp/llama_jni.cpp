@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <chrono>
+#include <mutex>
 
 #define LOG_TAG "SLMEngine"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -166,6 +167,15 @@ Java_com_interlekt_slmengine_LlamaWrapper_nativeFreeModel(JNIEnv*, jobject) {
     if (g_ctx)   { llama_free(g_ctx); g_ctx = nullptr; }
     if (g_model) { llama_model_free(g_model); g_model = nullptr; }
     LOGI("Model and context freed");
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_interlekt_slmengine_LlamaWrapper_nativeSystemInfo(JNIEnv* env, jobject) {
+    // CPU feature flags the build actually enabled: NEON, ARM_FMA, DOTPROD,
+    // MATMUL_INT8. Written into every results file's header, so a run is
+    // self-evidencing about which kernels it used rather than relying on a
+    // build log kept elsewhere.
+    return env->NewStringUTF(llama_print_system_info());
 }
 
 } // extern "C"

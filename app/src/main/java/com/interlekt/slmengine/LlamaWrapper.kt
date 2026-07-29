@@ -30,4 +30,7 @@ class LlamaWrapper {
     private external fun nativeGenerate(
         prompt: String, maxTokens: Int, callback: GenerationCallback)
     private external fun nativeFreeModel()
+
+    fun systemInfo(): String = nativeSystemInfo()
+    private external fun nativeSystemInfo(): String
 }
